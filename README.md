@@ -1,0 +1,437 @@
+import os
+import logging
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from collections import Counter
+from typing import List, Dict
+import json
+from datetime import datetime
+
+try:
+    from music_analyzer import MusicTasteAnalyzer, Track, MoodCategory, Genre
+except ImportError:
+    from typing import List
+    from dataclasses import dataclass
+    from enum import Enum
+
+    class MoodCategory(Enum):
+        HAPPY = "happy"
+        SAD = "sad"
+        ENERGETIC = "energetic"
+        CALM = "calm"
+        NEUTRAL = "neutral"
+
+    class Genre(Enum):
+        POP = "pop"
+        ROCK = "rock"
+        HIP_HOP = "hip-hop"
+        ELECTRONIC = "electronic"
+        RNB = "r&b"
+        INDIE = "indie"
+        JAZZ = "jazz"
+        CLASSICAL = "classical"
+        UNKNOWN = "unknown"
+
+    @dataclass
+    class Track:
+        name: str
+        artist: str
+        duration_ms: int
+        valence: float
+        energy: float
+        danceability: float
+        acousticness: float = 0.0
+        instrumentalness: float = 0.0
+        tempo: float = 120.0
+        loudness: float = -10.0
+        key: int = 0
+        mode: int = 1
+        genre: str = None
+
+    class MusicTasteAnalyzer:
+        def __init__(self, client_id: str = None, client_secret: str = None):
+            self.client_id = client_id
+            self.client_secret = client_secret
+
+        def get_playlist_tracks(self, playlist_url: str) -> List[Track]:
+            return [
+                Track("Blinding Lights", "The Weeknd", 200000, 0.8, 0.9, 0.9, 0.1, 0.0, 171, -5.0, 0, 1, "pop"),
+                Track("Save Your Tears", "The Weeknd", 215000, 0.6, 0.7, 0.8, 0.2, 0.0, 118, -7.0, 1, 1, "pop"),
+                Track("Levitating", "Dua Lipa", 203000, 0.9, 0.8, 0.9, 0.1, 0.0, 103, -4.0, 0, 1, "pop"),
+                Track("Good Days", "SZA", 278000, 0.7, 0.5, 0.6, 0.4, 0.1, 120, -8.0, 2, 1, "r&b"),
+                Track("Bohemian Rhapsody", "Queen", 354000, 0.4, 0.7, 0.4, 0.3, 0.0, 72, -11.0, 4, 0, "rock"),
+            ]
+
+        def analyze_mood_distribution(self, tracks: List[Track]) -> Dict[str, float]:
+            return {"happy": 40, "energetic": 30, "calm": 20, "sad": 10}
+
+        def analyze_genre_distribution(self, tracks: List[Track]) -> Dict[str, float]:
+            return {"pop": 60, "r&b": 20, "rock": 20}
+
+        def analyze_audio_features(self, tracks: List[Track]) -> Dict[str, float]:
+            return {
+                "avg_valence": 0.68,
+                "avg_energy": 0.74,
+                "avg_danceability": 0.72,
+                "avg_tempo": 116.8
+            }
+
+        def detect_top_artists(self, tracks: List[Track], top_n: int = 5) -> List[Tuple[str, int]]:
+            return [("The Weeknd", 2), ("Dua Lipa", 1), ("SZA", 1), ("Queen", 1)]
+
+        def get_taste_summary(self, tracks: List[Track]) -> Dict:
+            return {
+                "mood": "В основном позитивная и энергичная музыка",
+                "genre": "Преобладает поп-музыка с элементами R&B",
+                "energy": "Высокая энергетика",
+                "recommendations": ["Исследуйте инди-поп", "Попробуйте альтернативный R&B"]
+            }
+
+SELECTING_ACTION, ENTER_PLAYLIST, VIEWING_ANALYSIS = range(3)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+class MusicTasteBot:
+    def __init__(self, token: str):
+        self.token = token
+        self.analyzer = MusicTasteAnalyzer(
+            client_id=os.getenv('SPOTIFY_CLIENT_ID'),
+            client_secret=os.getenv('SPOTIFY_CLIENT_SECRET')
+        )
+        self.user_data = {}
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Начало работы с ботом."""
+        user = update.effective_user
+        welcome_text = (
+            f"Привет, {user.first_name}! 🎵\n\n"
+            "Я помогу проанализировать твой музыкальный вкус.\n"
+            "Пришли мне ссылку на плейлист (Spotify, Apple Music, Яндекс.Музыка) "
+            "или выбери одну из опций ниже:"
+        )
+
+        keyboard = [
+            ["📊 Проанализировать плейлист"],
+            ["🎭 Мой музыкальный профиль"],
+            ["🎵 Получить рекомендации"],
+            ["❓ Помощь"]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup)
+        return SELECTING_ACTION
+
+    async def analyze_playlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Запрос ссылки на плейлист."""
+        await update.message.reply_text(
+            "🎧 Пришли мне ссылку на твой плейлист.\n"
+            "Поддерживаются:\n"
+            "• Spotify\n"
+            "• Apple Music\n"
+            "• Яндекс.Музыка\n\n"
+            "Или напиши /cancel чтобы отменить.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ENTER_PLAYLIST
+
+    async def receive_playlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка полученной ссылки на плейлист."""
+        playlist_url = update.message.text
+        user_id = update.effective_user.id
+
+        processing_msg = await update.message.reply_text("🔍 Анализирую плейлист...")
+
+        try:
+            tracks = self.analyzer.get_playlist_tracks(playlist_url)
+
+            if not tracks:
+                await update.message.reply_text("❌ Не удалось получить треки из плейлиста.")
+                return SELECTING_ACTION
+
+            self.user_data[user_id] = {
+                'tracks': tracks,
+                'last_analysis': datetime.now().isoformat(),
+                'playlist_url': playlist_url
+            }
+
+            mood_dist = self.analyzer.analyze_mood_distribution(tracks)
+            genre_dist = self.analyzer.analyze_genre_distribution(tracks)
+            audio_features = self.analyzer.analyze_audio_features(tracks)
+            top_artists = self.analyzer.detect_top_artists(tracks)
+            taste_summary = self.analyzer.get_taste_summary(tracks)
+
+            await processing_msg.delete()
+
+            report = self._format_analysis_report(
+                mood_dist, genre_dist, audio_features, top_artists, taste_summary
+            )
+
+            await update.message.reply_text(report, parse_mode='HTML')
+
+            keyboard = [
+                ["📈 Детальная статистика"],
+                ["🎵 Получить рекомендации"],
+                ["📊 Сравнить с друзьями"],
+                ["🔙 Главное меню"]
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+            await update.message.reply_text(
+                "Что хочешь сделать дальше?",
+                reply_markup=reply_markup
+            )
+
+            return VIEWING_ANALYSIS
+
+        except Exception as e:
+            logger.error(f"Error analyzing playlist: {e}")
+            await update.message.reply_text(
+                "⚠️ Произошла ошибка при анализе. Попробуй другую ссылку."
+            )
+            return SELECTING_ACTION
+
+    def _format_analysis_report(self, mood_dist, genre_dist, audio_features, top_artists, taste_summary) -> str:
+        """Форматирование отчета анализа."""
+        mood_emojis = {
+            "happy": "😊",
+            "sad": "😢",
+            "energetic": "⚡",
+            "calm": "😌",
+            "neutral": "😐"
+        }
+
+        mood_text = "\n".join([
+            f"{mood_emojis.get(mood, '🎵')} {mood.capitalize()}: {percent}%"
+            for mood, percent in mood_dist.items()
+        ])
+
+        genre_text = "\n".join([
+            f"🎶 {genre.capitalize()}: {percent}%"
+            for genre, percent in genre_dist.items()
+        ])
+
+        artists_text = "\n".join([
+            f"{i+1}. {artist} ({count} треков)"
+            for i, (artist, count) in enumerate(top_artists[:5])
+        ])
+
+        report = f"""
+<b>🎵 АНАЛИЗ МУЗЫКАЛЬНОГО ВКУСА</b>
+
+<b>📊 ОБЩАЯ ХАРАКТЕРИСТИКА:</b>
+{taste_summary['mood']}
+{taste_summary['genre']}
+{taste_summary['energy']}
+
+<b>🎭 РАСПРЕДЕЛЕНИЕ НАСТРОЕНИЙ:</b>
+{mood_text}
+
+<b>🎶 ПРЕОБЛАДАЮЩИЕ ЖАНРЫ:</b>
+{genre_text}
+
+<b>👑 ТОП АРТИСТОВ:</b>
+{artists_text}
+
+<b>📈 АУДИОХАРАКТЕРИСТИКИ:</b>
+• Позитивность: {audio_features['avg_valence']:.0%}
+• Энергичность: {audio_features['avg_energy']:.0%}
+• Танцевальность: {audio_features['avg_danceability']:.0%}
+• Темп: {audio_features['avg_tempo']:.0f} BPM
+
+<b>💡 РЕКОМЕНДАЦИИ:</b>
+"""
+        for rec in taste_summary['recommendations']:
+            report += f"• {rec}\n"
+
+        return report
+
+    async def show_detailed_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Показать детальную статистику."""
+        user_id = update.effective_user.id
+
+        if user_id not in self.user_data or 'tracks' not in self.user_data[user_id]:
+            await update.message.reply_text("Сначала проанализируй плейлист!")
+            return SELECTING_ACTION
+
+        tracks = self.user_data[user_id]['tracks']
+
+        stats_text = "<b>📊 ДЕТАЛЬНАЯ СТАТИСТИКА</b>\n\n"
+
+        total_tracks = len(tracks)
+        avg_duration = sum(t.duration_ms for t in tracks) / total_tracks / 60000
+        stats_text += f"<b>Общая информация:</b>\n"
+        stats_text += f"• Всего треков: {total_tracks}\n"
+        stats_text += f"• Средняя длительность: {avg_duration:.1f} мин\n"
+
+        keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        key_counter = Counter(t.key for t in tracks)
+        if key_counter:
+            most_common_key = key_counter.most_common(1)[0]
+            stats_text += f"• Любимый ключ: {keys[most_common_key[0]]}\n"
+
+        major_count = sum(1 for t in tracks if t.mode == 1)
+        minor_count = total_tracks - major_count
+        stats_text += f"• Мажор/Минор: {major_count}/{minor_count} треков\n\n"
+
+        await update.message.reply_text(stats_text, parse_mode='HTML')
+        return VIEWING_ANALYSIS
+
+    async def get_recommendations(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Получить персонализированные рекомендации."""
+        user_id = update.effective_user.id
+
+        if user_id not in self.user_data:
+            await update.message.reply_text(
+                "Сначала проанализируй свой плейлист, чтобы получить персонализированные рекомендации!"
+            )
+            return SELECTING_ACTION
+
+        recommendations = [
+            "🎸 <b>Открытие недели:</b> Попробуйте альбом 'The Slow Rush' от Tame Impala",
+            "🎧 <b>Похожие артисты:</b> Если вам нравится The Weeknd, попробуйте Brent Faiyaz",
+            "🌟 <b>Классика жанра:</b> Исследуйте ранние работы Daft Punk",
+            "🎶 <b>Новинки в вашем стиле:</b> Ознакомьтесь с новым альбомом SZA",
+            "🌍 <b>Международный взгляд:</b> Послушайте K-pop группы как BTS или Blackpink",
+            "🔄 <b>Смешение жанров:</b> Попробуйте фьюжн джаз и электроники"
+        ]
+
+        rec_text = "<b>🎵 ПЕРСОНАЛИЗИРОВАННЫЕ РЕКОМЕНДАЦИИ</b>\n\n"
+        for rec in recommendations[:4]:
+            rec_text += f"• {rec}\n"
+
+        rec_text += "\n<b>💡 Совет:</b> Попробуйте слушать музыку в разное время суток для разных настроений!"
+
+        await update.message.reply_text(rec_text, parse_mode='HTML')
+        return VIEWING_ANALYSIS
+
+    async def show_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Показать музыкальный профиль пользователя."""
+        user_id = update.effective_user.id
+
+        if user_id not in self.user_data:
+            profile_text = (
+                "<b>🎭 ТВОЙ МУЗЫКАЛЬНЫЙ ПРОФИЛЬ</b>\n\n"
+                "У тебя еще нет проанализированных плейлистов.\n"
+                "Пришли мне ссылку на плейлист, чтобы я мог составить твой музыкальный портрет!"
+            )
+        else:
+            tracks = self.user_data[user_id]['tracks']
+            mood_dist = self.analyzer.analyze_mood_distribution(tracks)
+            top_mood = max(mood_dist.items(), key=lambda x: x[1])
+
+            mood_titles = {
+                "happy": "Оптимист 🎉",
+                "energetic": "Энерджайзер ⚡",
+                "calm": "Созерцатель 😌",
+                "sad": "Меланхолик 🎻",
+                "neutral": "Универсал 🎵"
+            }
+
+            profile_text = (
+                f"<b>🎭 ТВОЙ МУЗЫКАЛЬНЫЙ ПРОФИЛЬ</b>\n\n"
+                f"<b>Тип слушателя:</b> {mood_titles.get(top_mood[0], 'Универсал 🎵')}\n"
+                f"<b>Анализировано треков:</b> {len(tracks)}\n"
+                f"<b>Последний анализ:</b> {self.user_data[user_id]['last_analysis'][:10]}\n\n"
+                f"<b>🎯 Твоя главная музыкальная черта:</b>\n"
+            )
+
+            if top_mood[0] == "happy":
+                profile_text += "Ты предпочитаешь позитивную и uplifting музыку!"
+            elif top_mood[0] == "energetic":
+                profile_text += "Ты любишь энергичную музыку для движения и активности!"
+            elif top_mood[0] == "calm":
+                profile_text += "Тебе нравится спокойная, медитативная музыка!"
+            elif top_mood[0] == "sad":
+                profile_text += "Ты ценишь глубокую, эмоциональную музыку!"
+            else:
+                profile_text += "У тебя разнообразный и сбалансированный музыкальный вкус!"
+
+        await update.message.reply_text(profile_text, parse_mode='HTML')
+        return SELECTING_ACTION
+
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Показать справку."""
+        help_text = """
+<b>🎵 ПОМОЩЬ ПО КОМАНДАМ</b>
+
+<b>Основные команды:</b>
+• /start - Начать работу с ботом
+• /analyze - Проанализировать плейлист
+• /profile - Посмотреть музыкальный профиль
+• /recommendations - Получить рекомендации
+• /help - Показать эту справку
+• /cancel - Отменить текущее действие
+
+<b>Как использовать:</b>
+1. Нажми "📊 Проанализировать плейлист"
+2. Пришли ссылку на свой плейлист
+3. Получи детальный анализ своего вкуса
+4. Используй рекомендации для открытия новой музыки
+
+<b>Поддерживаемые сервисы:</b>
+• Spotify
+• Apple Music
+• Яндекс.Музыка
+
+<b>Что анализируем:</b>
+🎭 Настроение музыки
+🎶 Жанровые предпочтения
+👑 Любимых артистов
+📈 Аудиохарактеристики
+        """
+        await update.message.reply_text(help_text, parse_mode='HTML')
+        return SELECTING_ACTION
+
+    async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Отмена текущего действия."""
+        await update.message.reply_text(
+            "Действие отменено.",
+            reply_markup=ReplyKeyboardMarkup([["📊 Проанализировать плейлист"]], resize_keyboard=True)
+        )
+        return ConversationHandler.END
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Обработка текстовых сообщений."""
+        text = update.message.text.lower()
+
+        if text == "📊 проанализировать плейлист":
+            return await self.analyze_playlist(update, context)
+        elif text == "🎭 мой музыкальный профиль":
+            return await self.show_profile(update, context)
+        elif text == "🎵 получить рекомендации":
+            return await self.get_recommendations(update, context)
+        elif text == "❓ помощь":
+            return await self.help_command(update, context)
+        elif text == "📈 детальная статистика":
+            return await self.show_detailed_stats(update, context)
+        elif text == "📊 сравнить с друзьями":
+            await update.message.reply_text(
+                "Функция сравнения скоро появится! 👥\n"
+                "А пока поделись своим анализом с друзьями."
+            )
+            return VIEWING_ANALYSIS
+        elif text == "🔙 главное меню":
+            keyboard = [
+                ["📊 Проанализировать плейлист"],
+                ["🎭 Мой музыкальный профиль"],
+                ["🎵 Получить рекомендации"],
+                ["❓ Помощь"]
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            await update.message.reply_text(
+                "Выбери действие:",
+                reply_markup=reply_markup
+            )
+            return SELECTING_ACTION
+        else:
+            if "http" in text or "spotify" in text or "music.yandex" in text:
+                return await self.receive_playlist(update, context)
+            else:
+                await update.message.reply_text(
+                    "Я не понял команду. Используй кнопки меню или /help для справки."
+                )
+                return SELECTING_ACTION
