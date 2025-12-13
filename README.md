@@ -435,3 +435,44 @@ class MusicTasteBot:
                     "Я не понял команду. Используй кнопки меню или /help для справки."
                 )
                 return SELECTING_ACTION
+
+def main():
+    """Запуск бота."""
+    TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+
+    if not TELEGRAM_TOKEN:
+        raise ValueError("Необходимо установить TELEGRAM_BOT_TOKEN в переменных окружения")
+
+    bot = MusicTasteBot(TELEGRAM_TOKEN)
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', bot.start)],
+        states={
+            SELECTING_ACTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
+            ],
+            ENTER_PLAYLIST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.receive_playlist)
+            ],
+            VIEWING_ANALYSIS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', bot.cancel)],
+        allow_reentry=True
+    )
+
+    application.add_handler(CommandHandler("help", bot.help_command))
+    application.add_handler(CommandHandler("profile", bot.show_profile))
+    application.add_handler(CommandHandler("recommendations", bot.get_recommendations))
+    application.add_handler(CommandHandler("analyze", bot.analyze_playlist))
+
+    application.add_handler(conv_handler)
+
+    print("Бот запущен...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
